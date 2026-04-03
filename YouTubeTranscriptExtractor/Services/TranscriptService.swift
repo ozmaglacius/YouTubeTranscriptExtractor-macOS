@@ -243,7 +243,11 @@ enum TranscriptService {
         }
         if !url.contains("&fmt=") { url += "&fmt=xml" }
 
-        guard let body = try? await fetchText(from: url, session: session), !body.isEmpty else { return nil }
+        // Propagate real network/HTTP errors rather than collapsing them into nil.
+        // A nil return means "no usable transcript here, try next strategy";
+        // a thrown error means "something went wrong at the network level".
+        let body = try await fetchText(from: url, session: session)
+        guard !body.isEmpty else { return nil }
 
         let entries: [TranscriptEntry] = body.hasPrefix("{") || body.hasPrefix("[")
             ? parseJSON3(body)
@@ -256,9 +260,27 @@ enum TranscriptService {
     // MARK: - Language selection
 
     private static func findBestTrack(_ tracks: [CaptionTrack], languages: [String]) throws -> (CaptionTrack, String) {
-        for lang in languages { if let t = tracks.first(where: { $0.languageCode == lang && !$0.isGenerated }) { return (t, lang) } }
-        for lang in languages { if let t = tracks.first(where: { $0.languageCode == lang }) { return (t, lang) } }
+        // Matches a requested code against a track code, supporting regional variants.
+        // "en" matches "en", "en-US", "en-GB" etc.; "pt" matches "pt-BR".
+        func matches(_ trackCode: String, _ requested: String) -> Bool {
+            trackCode == requested || trackCode.hasPrefix(requested + "-")
+        }
+
+        // Priority 1: manual caption, exact or regional match
+        for lang in languages {
+            if let t = tracks.first(where: { matches($0.languageCode, lang) && !$0.isGenerated }) {
+                return (t, t.languageCode)
+            }
+        }
+        // Priority 2: any caption (manual or auto), exact or regional match
+        for lang in languages {
+            if let t = tracks.first(where: { matches($0.languageCode, lang) }) {
+                return (t, t.languageCode)
+            }
+        }
+        // Priority 3: any auto-generated transcript
         if let t = tracks.first(where: { $0.isGenerated }) { return (t, t.languageCode) }
+        // Priority 4: any available transcript
         if let t = tracks.first { return (t, t.languageCode) }
         throw TranscriptError.noTranscriptFound(languages.joined(separator: ", "))
     }
@@ -266,8 +288,13 @@ enum TranscriptService {
     // MARK: - Fetch helpers
 
     private static func fetchText(from urlString: String, session: URLSession) async throws -> String {
-        guard let url = URL(string: urlString) else { return "" }
-        let (data, _) = try await session.data(from: url)
+        guard let url = URL(string: urlString) else {
+            throw TranscriptError.fetchFailed("Malformed timedtext URL")
+        }
+        let (data, response) = try await session.data(from: url)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw TranscriptError.fetchFailed("Timedtext HTTP \(http.statusCode)")
+        }
         return String(data: data, encoding: .utf8) ?? ""
     }
 

@@ -126,7 +126,17 @@ enum YouTubeAPIService {
         ]
         guard let url = comps.url else { throw YouTubeAPIError.invalidURL }
 
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await URLSession.shared.data(from: url)
+
+        // Surface API-level errors (invalid key, quota exceeded, etc.) directly
+        // rather than collapsing them into noVideosFound.
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let json    = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let message = (json?["error"] as? [String: Any])?["message"] as? String
+                          ?? "HTTP \(http.statusCode)"
+            throw YouTubeAPIError.apiError(message)
+        }
+
         guard let json    = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let entries = json["items"] as? [[String: Any]],
               let first   = entries.first,
